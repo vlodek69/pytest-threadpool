@@ -1017,6 +1017,42 @@ class ParallelRunner:
 
         cancelled = threading.Event()
 
+        def _drive_extra_hooks(hook_caller, item, core_prefix="_pytest."):
+            """Manually run non-core hookwrapper implementations of a
+            pytest_runtest_setup/call/teardown hook (e.g. allure-pytest's).
+
+            The parallel worker path calls item.setup()/item.runtest()
+            directly instead of going through ihook.pytest_runtest_setup(...)
+            etc., because pytest's own default implementation touches
+            session._setupstate, which is not thread-safe. That also means
+            instrumentation plugins that hook these same events (allure,
+            possibly others) never get invoked, silently breaking their
+            per-test bookkeeping. This drives everyone EXCEPT pytest's own
+            core implementation (identified by module prefix), so allure's
+            wrapper still fires without reintroducing the thread-unsafe path.
+            """
+            gens = []
+            for hookimpl in hook_caller.get_hookimpls():
+                plugin_module = getattr(type(hookimpl.plugin), "__module__", "") or ""
+                if plugin_module.startswith(core_prefix):
+                    continue
+                if not (getattr(hookimpl, "hookwrapper", False) or getattr(hookimpl, "wrapper", False)):
+                    continue
+                gen = hookimpl.function(item=item)
+                try:
+                    next(gen)
+                    gens.append(gen)
+                except StopIteration:
+                    pass
+            return gens
+
+        def _finish_extra_hooks(gens):
+            for gen in gens:
+                try:
+                    gen.send(None)
+                except StopIteration:
+                    pass
+
         def _do_setup_call_teardown(test_item):
             """Setup + call + teardown worker (for items with cloned FixtureDefs).
 
@@ -1050,10 +1086,14 @@ class ParallelRunner:
             node_fins = []
             test_item.addfinalizer = lambda fin: node_fins.append(fin)
 
+            extra_setup_hooks = _drive_extra_hooks(
+                test_item.ihook.pytest_runtest_setup, test_item
+            )
             try:
                 setup_info = CallInfo.from_call(lambda: test_item.setup(), when="setup")
             finally:
                 test_item.addfinalizer = original_addfinalizer
+                _finish_extra_hooks(extra_setup_hooks)
 
             if setup_info.excinfo is None:
                 fixture_fins = FixtureManager.save_and_clear_function_fixtures(test_item)
@@ -1078,7 +1118,13 @@ class ParallelRunner:
 
                 if not cancelled.is_set():
                     live.mark_running(test_item)
-                    call_info = CallInfo.from_call(lambda: test_item.runtest(), when="call")
+                    extra_call_hooks = _drive_extra_hooks(
+                        test_item.ihook.pytest_runtest_call, test_item
+                    )
+                    try:
+                        call_info = CallInfo.from_call(lambda: test_item.runtest(), when="call")
+                    finally:
+                        _finish_extra_hooks(extra_call_hooks)
                     if not cancelled.is_set():
                         live.mark_call_done(test_item, call_info.excinfo)
 
@@ -1088,10 +1134,16 @@ class ParallelRunner:
                 # Run function-scoped fixture teardown in the worker.
                 # Includes yield cleanup, addfinalizer callbacks, and
                 # node-level finalizers captured during setup.
-                all_fins = list(node_fins) + fixture_fins
-                teardown_info = CallInfo.from_call(
-                    lambda fns=all_fins: FixtureManager.run_finalizers(fns), when="teardown"
+                extra_teardown_hooks = _drive_extra_hooks(
+                    test_item.ihook.pytest_runtest_teardown, test_item
                 )
+                all_fins = list(node_fins) + fixture_fins
+                try:
+                    teardown_info = CallInfo.from_call(
+                        lambda fns=all_fins: FixtureManager.run_finalizers(fns), when="teardown"
+                    )
+                finally:
+                    _finish_extra_hooks(extra_teardown_hooks)
                 return test_item, setup_info, call_info, teardown_info
 
             FixtureManager.clear_function_fixture_caches(test_item)
